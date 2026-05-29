@@ -29,11 +29,12 @@
 #include "cdc.h"
 #include "cdcuser.h"
 #include "timer.h"
+#include "usb2p.h"
+#include "usbuser.h"
 
 #include "usbinterface.h"
 #include CONFIG_MCU_H //interrupt disable
 
-unsigned char BulkBufIn  [USB_CDC_BUFINSIZE];            // Buffer to store USB IN  packet
 unsigned char BulkBufOut [USB_CDC_BUFOUTSIZE];            // Buffer to store USB OUT packet
 unsigned char NotificationBuf [10];
 unsigned char soft_bulkin_int=0;
@@ -44,6 +45,13 @@ volatile uint8_t  cdc_bulkIN_occupied = 0;
 volatile uint8_t  cdc_bulkIN_ZLP      = 0;
 
 volatile uint8_t  cdc_bulkOUT_occupied = 0;
+volatile uint8_t  cdc2p_active         = 0;
+volatile uint8_t  cdc2p_enable_pending = 0;
+/* 1 = the last USB2P IN packet was a full 64 B max-packet, so a transfer that
+   ends exactly on a 64 B multiple still needs a terminating ZLP (otherwise the
+   host's bulk read waits forever for the continuation).  Set on a full-size
+   write, cleared on a short write or the ZLP. */
+volatile uint8_t  cdc2p_in_need_zlp    = 0;
 
 CDC_LINE_CODING CDC_LineCoding  = {9600, 0, 0, 8};
 unsigned short  CDC_SerialState = 0x0000;
@@ -77,6 +85,8 @@ typedef struct __CDC_BUF_T {
 } CDC_BUF_T;
 
 CDC_BUF_T  CDC_OutBuf;                                 // buffer for all CDC Out data
+
+#define CDC2P_IN_DEPTH 2
 
 /*----------------------------------------------------------------------------
   read data from CDC_OutBuf
@@ -263,6 +273,9 @@ uint32_t CDC_SetControlLineState (unsigned short wControlSignalBitmap) {
   // init USB state
   if ((wControlSignalBitmap ^ prev) & 0x1) {
     usbint_set_state(wControlSignalBitmap & 0x1);
+    if (!(wControlSignalBitmap & 0x1)) {
+      CDC2P_Disable();
+    }
   }
 
   prev = wControlSignalBitmap;
@@ -295,6 +308,70 @@ void CDC_block_conf (void) {
   cdc_bulkIN_occupied = 0;
   cdc_bulkIN_ZLP      = 0;
 
+}
+
+void CDC2P_EnableAfterLegacyResponse(void) {
+  cdc2p_enable_pending = 1;
+}
+
+void CDC2P_Enable(void) {
+  CDC_block_conf();
+  usb2p_reset();
+  cdc2p_in_need_zlp = 0;
+  cdc2p_active = 1;
+  cdc2p_enable_pending = 0;
+}
+
+void CDC2P_Disable(void) {
+  if (cdc2p_active || cdc2p_enable_pending) {
+    cdc2p_active = 0;
+    cdc2p_enable_pending = 0;
+    usb2p_reset();
+  }
+}
+
+static uint8_t CDC2P_InReady(void) {
+#ifdef CONFIG_MK3_STM32
+  return Endpoint_IsINReady();
+#else
+  return USB_TxBufAvail(CDC_DEP_IN) > 0;
+#endif
+}
+
+void CDC2P_KickTx(void) {
+  static uint8_t zlp_dummy;
+  uint8_t *src = &zlp_dummy;   /* valid pointer for the cnt==0 ZLP write */
+  uint32_t len;
+  uint8_t writes = 0;
+  uint8_t lock;
+
+  if (!cdc2p_active) {
+    return;
+  }
+
+  /* Ship straight out of tx_buf (zero-copy): USB_WriteEP copies into the SIE
+     FIFO synchronously, so the peeked pointer only needs to survive that call. */
+  lock = usb2p_tx_lock();
+  while (writes < CDC2P_IN_DEPTH && CDC2P_InReady()) {
+    len = usb2p_tx_peek(&src, USB_CDC_BUFINSIZE);
+    if (!len) {
+      /* Buffer drained.  If the previous packet exactly filled a 64 B max-packet,
+         the host's bulk IN transfer has no short packet to terminate on, so emit
+         a zero-length packet to close it (USB 2.0 §5.8.3).  One ZLP suffices; it
+         is itself a short packet, so clear the flag. */
+      if (cdc2p_in_need_zlp) {
+        USB_WriteEP(CDC_DEP_IN, src, 0);
+        cdc2p_in_need_zlp = 0;
+        writes++;
+      }
+      break;
+    }
+    USB_WriteEP(CDC_DEP_IN, src, len);
+    usb2p_tx_consume(len);
+    cdc2p_in_need_zlp = (len == USB_CDC_BUFINSIZE);
+    writes++;
+  }
+  usb2p_tx_unlock(lock);
 }
 
 
@@ -343,6 +420,11 @@ void CDC_BulkIn(void) {
   int numBytesSend;
   //    printf("called CDC_BulkIn\n");                                                     // split into packets
 
+  if (cdc2p_active) {
+    CDC2P_KickTx();
+    return;
+  }
+
   // *interrupt
   // fill the buffer if it's empty
   //usbint_handler();
@@ -367,45 +449,16 @@ void CDC_BulkIn(void) {
     cdc_bulkIN_occupied = 0;
   }
 
+  /* Keep the legacy ZLP: Windows usbser may hold a 512B response until the
+     max-packet-multiple transfer is terminated by a short packet. */
+  if (cdc2p_enable_pending && !cdc_bulkIN_count && !cdc_bulkIN_ZLP) {
+    CDC2P_Enable();
+    return;
+  }
+
   // fill send buffer if it's available
   if (!cdc_bulkIN_count && usbint_server_dat()) usbint_handler_dat();
 }
-
-
-/*
-  void CDC_BulkIn(void) {
-  int numBytesRead;
-
-  // TODO read print buffer
-  //uart_putc('Y');
-  //call usb_fkt get data read endpoint
-
-  NVIC_DisableIRQ(USB_IRQn);
-  numBytesRead = read_usbbuffer(&BulkBufIn[0]);
-  //  numBytesRead = ser_Read ((char *)&BulkBufIn[0], &numBytesAvail);
-
-  // send over USB
-
-  if (numBytesRead > 0) {
-
-  //evtl. use better solution from here
-  //http://www.lpcware.com/content/forum/usb-cdc-maximum-bandwidth
-
-
-
-  USB_WriteEP (CDC_DEP_IN, &BulkBufIn[0], numBytesRead);
-
-
-  }
-  else {
-  CDC_DepInEmpty = 1;
-  }
-  NVIC_EnableIRQ(USB_IRQn);
-
-
-  return;
-  }
-*/
 
 /*----------------------------------------------------------------------------
   CDC_BulkOut call on DataOut Request
@@ -414,6 +467,13 @@ void CDC_BulkIn(void) {
  *---------------------------------------------------------------------------*/
 void CDC_BulkOut(void) {
   int numBytesRead;
+
+  if (cdc2p_active) {
+    numBytesRead = USB_ReadEP(CDC_DEP_OUT, &BulkBufOut[0]);
+    usb2p_rx_bytes(BulkBufOut, numBytesRead);
+    CDC2P_KickTx();
+    return;
+  }
 
   // get data from USB into intermediate buffer
   if ( /*!cdc_bulkIN_occupied &&*/ !usbint_server_busy()) {

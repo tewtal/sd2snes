@@ -21,12 +21,15 @@
 #include <stdio.h>
 //debug
 
+#include "config.h"
 #include "usb.h"
 #include "usbcfg.h"
 #include "usbhw.h"
 #include "usbcore.h"
 #include "usbuser.h"
 #include "cdcuser.h"
+#include "usb2p.h"
+#include "timer.h"   /* getticks(), HZ — SysTick fallback for usb2p_hires_cycles */
 
 extern unsigned char soft_bulkin_int;
 
@@ -49,6 +52,8 @@ void USB_Power_Event (uint32_t  power) {
 
 #if USB_RESET_EVENT
 void USB_Reset_Event (void) {
+  CDC2P_Disable();
+  usb2p_reset();
   USB_ResetCore();
 }
 #endif
@@ -122,6 +127,8 @@ void USB_Configure_Event (void) {
     /* add your code here */
     //saturnu new - org: not there:>
 	CDC_block_conf ();
+    CDC2P_Disable();
+    usb2p_reset();
   }
 }
 #endif
@@ -235,6 +242,139 @@ void USB_EndPoint3 (uint32_t event) {
  */
 
 void USB_EndPoint4 (uint32_t event) {
+}
+
+static uint8_t usb2p_usb_irq_enabled(void) {
+#if defined(USB_IRQn)
+  return NVIC_GetEnableIRQ(USB_IRQn) != 0;
+#elif defined(OTG_FS_IRQn)
+  return NVIC_GetEnableIRQ(OTG_FS_IRQn) != 0;
+#else
+  return 1;
+#endif
+}
+
+/* Short critical section guarding tx_buf shared state between the main-loop
+   producer (usb2p_queue_frame) and the USB-ISR consumer (usb2p_tx_peek via
+   CDC2P_KickTx).  Masks only the USB IRQ — the same interrupt the ISR
+   runs on — so the window is just the tx_buf pointer/byte manipulation, NOT
+   the slow SPI read that precedes it.  This is what lets IN-complete IRQs
+   keep shipping buffered packets while the main loop reads the next DAT chunk
+   over SPI (the SPI read runs with the USB IRQ enabled).
+
+   Save/restore semantics: usb2p_queue_frame runs in BOTH the main loop (drain)
+   and the USB ISR itself (queuing a HELLO/INFO/NAK response).  In the ISR the
+   USB IRQ is already masked, so we must only re-enable on unlock if it was
+   enabled on lock — otherwise we'd wrongly enable the IRQ from inside the ISR.
+   Returns the prior state to pass back to unlock. */
+uint8_t usb2p_tx_lock(void) {
+  uint8_t was_enabled = usb2p_usb_irq_enabled();
+  if (was_enabled) USB_DisableIRQ();
+  return was_enabled;
+}
+void usb2p_tx_unlock(uint8_t prev) {
+  if (prev) USB_EnableIRQ();
+}
+
+/* Free-running high-resolution clock for sub-tick watch polling.
+ *
+ * The 100 Hz SysTick is too coarse to schedule address-watch polls finely
+ * (see usb2p_watch.c): a watch wants to sample within a few ms of a trigger
+ * change so the captured context is still coherent.  The Cortex-M DWT cycle
+ * counter is a free-running 32-bit counter at CPU_FREQUENCY with no setup cost
+ * and no contention (unlike the RIT/TIM2 one-shots that delay_us() borrows).
+ *
+ * The watch scheduler compares deadlines with time_after()/time_before(), whose
+ * signed-difference trick requires a counter that wraps at a power of 2.  The
+ * raw cycle counter (usb2p_hires_cycles) satisfies that — it wraps at 2^32 every
+ * ~44.7 s at 96 MHz and the comparisons stay correct across the wrap.
+ *
+ * CAVEAT: DWT CYCCNT only counts with the debug block powered; on the LPC it can
+ * be frozen at 0 standalone (no debugger).  usb2p_hires_init self-tests it and,
+ * when frozen, usb2p_hires_cycles falls back to a SysTick-derived cycle count
+ * (same 2^32 wrap property).  Without this, watch scheduling froze after the
+ * INITIAL event — see usb2p_hires_cycles. */
+static uint8_t hires_inited;
+/* 1 = DWT CYCCNT verified counting; 0 = use the SysTick-derived fallback.  On the
+   LPC176x (Cortex-M3) the DWT cycle counter only advances when the debug block is
+   powered (typically by an attached debugger); standalone it can stay frozen at 0.
+   A frozen clock froze watch scheduling: the first poll runs (deadline starts 0)
+   so the INITIAL event ships, but every later poll is gated on time_before(now,
+   next_poll_cyc) with now==0 forever, so no change events ever fire.  We verify
+   CYCCNT actually advances and fall back to a SysTick-based cycle count if not. */
+static uint8_t hires_use_dwt;
+
+static void usb2p_hires_init(void) {
+  uint32_t t0, t1;
+  volatile uint32_t spin;
+
+  if (hires_inited) return;
+
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+  /* Self-test: burn a few hundred cycles and check CYCCNT moved.  If it didn't,
+     the debug block isn't clocking the counter (no debugger attached on this
+     LPC) and we must not use it — see hires_use_dwt. */
+  t0 = DWT->CYCCNT;
+  for (spin = 0; spin < 100; spin++) { /* deliberate busy work */ }
+  t1 = DWT->CYCCNT;
+  hires_use_dwt = (t1 != t0);
+
+  hires_inited = 1;
+}
+
+/* Raw free-running cycle counter.  Wraps cleanly at 2^32, so time_after()/
+   time_before() work across the wrap (every ~44.7 s at 96 MHz).  This is the
+   correct clock for scheduling deadlines; convert ms/us deadlines to cycles via
+   USB2P_CYCLES_PER_US / USB2P_CYCLES_PER_MS.
+
+   DWT CYCCNT is preferred (single-instruction read, full CPU-clock resolution),
+   but on the LPC it only runs with the debug block powered, so when the init
+   self-test found it frozen we synthesize an equivalent counter from SysTick:
+   completed-tick cycles + the intra-tick down-count.  Both terms are real elapsed
+   cycles, so the sum is a genuine cycle count that wraps at 2^32 — the property
+   time_after()/time_before() need.  Granularity is then bounded by how often the
+   value is sampled (main-loop rate), not by the 10 ms tick: the SysTick->VAL term
+   gives sub-tick resolution. */
+uint32_t usb2p_hires_cycles(void) {
+  uint32_t reload, val, t0, t1;
+
+  if (hires_use_dwt) {
+    return DWT->CYCCNT;
+  }
+
+  /* Read tick + intra-tick count coherently: re-read the tick and retry if the
+     SysTick wrapped between the two reads (handler may have bumped `ticks`). */
+  reload = SysTick->LOAD;
+  do {
+    t0  = getticks();
+    val = SysTick->VAL;
+    t1  = getticks();
+  } while (t0 != t1);
+
+  return t0 * (reload + 1u) + (reload - val);
+}
+
+int USB2P_Poll(void) {
+  int cmd;
+
+  usb2p_hires_init();
+
+  /* usb2p_poll() runs with the USB IRQ ENABLED so its SPI reads overlap with
+     USB packet shipping: while the main loop reads the next DAT chunk over
+     SPI, IN-complete IRQs keep draining tx_buf to the host.  The shared
+     tx_buf state is guarded by the short critical section inside
+     usb2p_queue_frame (usb2p_tx_lock), not by masking the whole poll. */
+  usb2p_poll();
+
+  /* CDC2P_KickTx flushes the framed byte stream out the CDC IN endpoint when
+     the transport has been upgraded; a no-op in plain serial mode. */
+  CDC2P_KickTx();
+
+  cmd = usb2p_take_command();
+  return cmd;
 }
 
 

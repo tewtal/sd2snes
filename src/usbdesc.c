@@ -28,6 +28,11 @@
 
 
 /* USB Standard Device Descriptor */
+/* Single-function CDC-ACM device.  USB2P is not a separate interface: a session
+   starts as the legacy usb2snes CDC byte protocol and upgrades into USB2P
+   framing in place on the same CDC data endpoint (see cdcuser.c CDC2P_*), so the
+   descriptor is the plain CDC one and idProduct stays 0x5A22 for backward
+   compatibility with hosts that detect the device by that ID. */
 const uint8_t USB_DeviceDescriptor[] = {
   USB_DEVICE_DESC_SIZE,              /* bLength */
   USB_DEVICE_DESCRIPTOR_TYPE,        /* bDescriptorType */

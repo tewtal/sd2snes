@@ -83,6 +83,7 @@ SRC += cli.c ymodem.c rle.c msu1.c crc16.c sysinfo.c
 SRC += cfg.c cheat.c yaml.c savestate.c sgb.c hwinfo.c
 
 SRC += usbdesc.c usbcore.c usbuser.c cdcuser.c usbinterface.c
+SRC += usb2p.c usb2p_codec.c usb2p_path.c usb2p_mem.c usb2p_fs.c usb2p_watch.c usb2p_sched.c
 
 # List Assembler source files here.
 #     Make them always end in a capital .S.  Files ending in a lowercase .s

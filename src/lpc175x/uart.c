@@ -125,7 +125,14 @@ void uart_putc(char c) {
     UART_REGS->THR = (unsigned char)c;
   } else {
 #ifdef CONFIG_UART_DEADLOCKABLE
-    while (tmp == read_idx) ;
+    /* Ring full — drop the byte rather than spinning.  The original
+       behaviour spun until the UART had drained, which at 921600 baud
+       costs ~30us per byte and can stall the menu loop for milliseconds
+       under a printf burst.  That stall blocks usbint_handler / USB2P_Poll
+       and shows up as ~10ms tail latency on USB ops.  Dropping is safer:
+       this device commonly runs with no UART consumer attached, so the
+       log output is unobservable anyway. */
+    if (tmp == read_idx) return;
 #endif
     BITBAND(UART_REGS->IER, 1) = 0; // turn off UART interrupt
     txbuf[write_idx] = c;

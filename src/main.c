@@ -486,8 +486,14 @@ int main(void) {
       if (usb_cmd == SNES_CMD_GAMELOOP) usb_cmd = 0;
 
 //        sleep_ms(250);
-      sram_reliable();
-      
+      /* sram_reliable() reads the FPGA SRAM scratchpad 256 times via SPI
+         (~3-4 ms per call) to verify the bus and drive the rdy LED.  Its
+         only functional consumer in this loop is the autosave path
+         (snes.c sram_valid gate); with autosave off it provides no value
+         and just stalls the menu loop, blocking usbint_handler /
+         USB2P_Poll.  Skip it when autosave is disabled. */
+      if(CFG.enable_autosave) sram_reliable();
+
       // loop if we are in the middle of a reset
       if (usbint_server_reset()) continue;
       
@@ -507,7 +513,12 @@ int main(void) {
         if(getticks() > loop_ticks + 25) {
           loop_ticks = getticks();
  //         sram_reliable();
-          printf("%s ", get_cic_statename(get_cic_state()));
+          /* Diagnostic printf("%s ", get_cic_statename(get_cic_state())) removed.
+             get_cic_state() runs a 100000-iter polling loop (~10 ms) sampling
+             the CIC line at ~10 MHz.  Every 250 ms it would stall the menu
+             loop for ~10 ms, blocking usbint_handler / USB2P_Poll and showing
+             up as a ~13 ms tail latency on USB2P backend ops.  The result was
+             only used for a UART debug print. */
           cmd=snes_main_loop();
           if (usb_cmd && !cmd) cmd = usb_cmd;
           if(cmd) {

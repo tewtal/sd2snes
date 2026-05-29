@@ -19,6 +19,8 @@
 #ifndef __CDCUSER_H__
 #define __CDCUSER_H__
 
+#include <stdint.h>
+
 /* CDC buffer handling */
 extern int CDC_RdOutBuf        (char *buffer, const int *length);
 extern int CDC_WrOutBuf        (const char *buffer, int *length);
@@ -49,9 +51,15 @@ void CDC_block_init(uint8_t *buffer, uint32_t send_size);
 uint32_t CDC_block_send( uint8_t *buffer, uint32_t send_size );
 int CDC_BulkIn_occupied(void);
 
+/* USB2P framed byte stream over the CDC data endpoint.  Entered by the legacy
+   USBA upgrade command; reset by CDC close/config reset. */
+void CDC2P_EnableAfterLegacyResponse(void);
+void CDC2P_Enable(void);
+void CDC2P_Disable(void);
+void CDC2P_KickTx(void);
+
 /* CDC Bulk Callback Functions */
 extern void CDC_BulkIn                   (void);
-extern void CDC_BulkIn_                   (void);
 extern void CDC_BulkOut                  (void);
 
 /* CDC Notification Callback Function */

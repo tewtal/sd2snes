@@ -57,10 +57,6 @@ extern MSC_CSW CSW;
 
 #endif
 
-#if (USB_VENDOR)
-#include "vendor.h"
-#endif
-
 #if defined   (  __CC_ARM  )
 #pragma diag_suppress 111,1441
 #endif
@@ -927,43 +923,6 @@ setup_class_ok:                                                          /* requ
           break;  /* end case REQUEST_CLASS */
 #endif  /* USB_CLASS */
 
-#if USB_VENDOR
-        case REQUEST_VENDOR:
-          switch (SetupPacket.bmRequestType.BM.Recipient) {
-
-            case REQUEST_TO_DEVICE:
-              if (!USB_ReqVendorDev(1)) {
-                goto stall_i;                                            /* not supported */
-              }
-              break;
-
-            case REQUEST_TO_INTERFACE:
-              if (!USB_ReqVendorIF(1)) {
-                goto stall_i;                                            /* not supported */
-              }
-              break;
-
-            case REQUEST_TO_ENDPOINT:
-              if (!USB_ReqVendorEP(1)) {
-                goto stall_i;                                            /* not supported */
-              }
-              break;
-
-            default:
-              goto stall_i;
-          }
-
-          if (SetupPacket.wLength) {
-            if (SetupPacket.bmRequestType.BM.Dir == REQUEST_DEVICE_TO_HOST) {
-              USB_DataInStage();
-            }
-          } else {
-            USB_StatusInStage();
-          }
-
-          break;  /* end case REQUEST_VENDOR */
-#endif  /* USB_VENDOR */
-
         default:
 stall_i:  USB_SetStallEP(0x80);
           EP0Data.Count = 0;
@@ -1068,37 +1027,6 @@ stall_i:  USB_SetStallEP(0x80);
 out_class_ok:                                                            /* request finished successfully */
                 break; /* end case REQUEST_CLASS */
 #endif  /* USB_CLASS */
-
-#if USB_VENDOR
-              case REQUEST_VENDOR:
-                switch (SetupPacket.bmRequestType.BM.Recipient) {
-
-                  case REQUEST_TO_DEVICE:
-                    if (!USB_ReqVendorDev(0)) {
-                      goto stall_i;                                      /* not supported */
-                    }
-                    break;
-
-                  case REQUEST_TO_INTERFACE:
-                    if (!USB_ReqVendorIF(0)) {
-                      goto stall_i;                                      /* not supported */
-                    }
-                    break;
-
-                  case REQUEST_TO_ENDPOINT:
-                    if (!USB_ReqVendorEP(0)) {
-                      goto stall_i;                                      /* not supported */
-                    }
-                    break;
-
-                  default:
-                    goto stall_i;
-                }
-
-                USB_StatusInStage();
-
-                break;  /* end case REQUEST_VENDOR */
-#endif  /* USB_VENDOR */
 
               default:
                 goto stall_i;

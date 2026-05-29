@@ -19,6 +19,8 @@
 #ifndef __USBUSER_H__
 #define __USBUSER_H__
 
+#include <stdint.h>
+
 
 /* USB Device Events Callback Functions */
 extern void USB_Power_Event     (uint32_t power);
@@ -69,5 +71,19 @@ extern void USB_EndPoint15 (uint32_t event);
 extern void USB_Configure_Event (void);
 extern void USB_Interface_Event (void);
 extern void USB_Feature_Event   (void);
+
+/* Poll USB2P transport housekeeping from the main firmware loop. */
+extern int  USB2P_Poll          (void);
+
+/* Raw DWT cycle counter; wraps cleanly at 2^32, so time_after()/time_before()
+   are valid across the wrap (~44.7 s at 96 MHz).  The correct clock for the
+   address-watch scheduler's deadlines (convert ms/us to cycles).  Initialized
+   by USB2P_Poll on first invocation. */
+extern uint32_t usb2p_hires_cycles(void);
+
+/* tx_buf producer/consumer critical section (USB IRQ mask, save/restore).
+   Wrap only the brief tx_buf state mutation — never the SPI read. */
+extern uint8_t usb2p_tx_lock(void);
+extern void    usb2p_tx_unlock(uint8_t prev);
 
 #endif  /* __USBUSER_H__ */

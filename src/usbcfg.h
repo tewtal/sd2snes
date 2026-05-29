@@ -127,6 +127,9 @@
 #define USB_WAKEUP_EVENT    0
 #define USB_SOF_EVENT       0
 #define USB_ERROR_EVENT     0
+/* EP event mask: bit n enables the USB_EndPoint<n> callback.
+   0x0007 = EP0..EP2 (CDC).  USB2P now rides the CDC data endpoint (EP2), so no
+   dedicated vendor endpoint is needed. */
 #define USB_EP_EVENT        0x0007
 #define USB_CONFIGURE_EVENT 1
 #define USB_INTERFACE_EVENT 0

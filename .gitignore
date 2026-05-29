@@ -142,3 +142,13 @@ verilog/*/incremental_db
 obj/
 snes/menu.rtc
 snes/menu.srm
+
+# build output and local tooling state
+src/obj-mk3-stm32
+src/.ARG_VERSION
+build/
+.vscode/
+.claude/
+__pycache__/
+*.pyc
+build-mk2.sh

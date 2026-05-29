@@ -44,11 +44,13 @@
 #include "fpga_spi.h"
 #include "usbinterface.h"
 #include "usbhw.h"
+#include "usbuser.h"
 #include "rtc.h"
 #include "cfg.h"
 #include "cdcuser.h"
 #include "cheat.h"
 #include "yaml.h"
+#include "usb2p_protocol_generated.h"  /* USB2P_MAX_*_PAYLOAD for the shared buffer union */
 
 static inline void __DMB2(void) { asm volatile ("dmb" ::: "memory"); }
 
@@ -124,7 +126,8 @@ enum usbint_server_stream_state_e { FOREACH_SERVER_STREAM_STATE(GENERATE_ENUM) }
   OP(USBINT_SERVER_OPCODE_STREAM)               \
   OP(USBINT_SERVER_OPCODE_TIME)                 \
                                                 \
-  OP(USBINT_SERVER_OPCODE_RESPONSE)
+  OP(USBINT_SERVER_OPCODE_RESPONSE)             \
+  OP(USBINT_SERVER_OPCODE_CDC2P)
 enum usbint_server_opcode_e { FOREACH_SERVER_OPCODE(GENERATE_ENUM) };
 #ifdef DEBUG_USB
 static const char *usbint_server_opcode_s[] = { FOREACH_SERVER_OPCODE(GENERATE_STRING) };
@@ -184,13 +187,42 @@ extern snes_romprops_t romprops;
 extern uint16_t current_features;
 
 unsigned recv_buffer_offset = 0;
-unsigned char recv_buffer[USB_BLOCK_SIZE];
-volatile unsigned char cmd_buffer[USB_BLOCK_SIZE];
 
-// double buffered because send only guarantees that a transfer is
-// volatile since CDC needs to send it
+/* The legacy USBA data buffers and the USB2P chunk buffers are never live at the
+   same time: a CDC session runs EITHER the legacy USBA protocol OR (after the
+   one-way CDC2P upgrade) the USB2P byte stream.  The upgrade only fires after the
+   legacy response has fully drained out of send_buffer (cdcuser.c CDC_BulkIn),
+   and after it cdc2p_active bypasses the whole legacy OUT/IN path, so server_state
+   is frozen IDLE and these legacy buffers go quiescent.  Overlaying the two USB2P
+   chunk buffers (read_payload, pending_op_chunk — each USB2P_MAX_*_PAYLOAD = 1 KB)
+   onto the legacy buffers here keeps them in main RAM and out of the near-full AHB
+   SRAM region.  The two arms are equal-sized (2 KB), so the union adds no net RAM.
+   See README.usb2p.md §12.3 and the CDC2P_* handoff. */
+static union {
+  struct {
+    unsigned char recv_buffer[USB_BLOCK_SIZE];            /* 512 */
+    volatile unsigned char cmd_buffer[USB_BLOCK_SIZE];    /* 512 */
+    /* double buffered because send only guarantees the transfer started;
+       volatile since the USB ISR drains it */
+    volatile unsigned char send_buffer[2][USB_BLOCK_SIZE]; /* 1024 */
+  } legacy;
+  struct {
+    uint8_t read_payload[USB2P_MAX_TX_DAT_PAYLOAD];       /* 1024 */
+    uint8_t pending_op_chunk[USB2P_MAX_RX_PAYLOAD];       /* 1024 */
+  } usb2p;
+} usbbuf;
+
+#define recv_buffer  (usbbuf.legacy.recv_buffer)
+#define cmd_buffer   (usbbuf.legacy.cmd_buffer)
+#define send_buffer  (usbbuf.legacy.send_buffer)
+
+/* USB2P chunk buffers alias the legacy arm above (see comment).  Exported as
+   pointers so usb2p_mem.c / usb2p_fs.c reference them unchanged (index / + only,
+   never sizeof/&). */
+uint8_t * const read_payload     = (uint8_t *)usbbuf.usb2p.read_payload;
+uint8_t * const pending_op_chunk = (uint8_t *)usbbuf.usb2p.pending_op_chunk;
+
 volatile uint8_t send_buffer_index = 0;
-volatile unsigned char send_buffer[2][USB_BLOCK_SIZE];
 
 // directory
 static DIR     dh;
@@ -433,11 +465,12 @@ int usbint_handler(void) {
     int ret = 0;
 
     usbint_check_connect();
+    ret |= USB2P_Poll();
 
     switch(server_state) {
-            case USBINT_SERVER_STATE_HANDLE_CMD: ret = usbint_handler_cmd(); break;
+            case USBINT_SERVER_STATE_HANDLE_CMD: ret |= usbint_handler_cmd(); break;
             // FIXME: are these needed anymore?  PUSHDAT was for non-interrupt operation and EXE uses flags now
-            case USBINT_SERVER_STATE_HANDLE_DATPUSH: ret = usbint_handler_dat(); break;
+            case USBINT_SERVER_STATE_HANDLE_DATPUSH: ret |= usbint_handler_dat(); break;
 
             default: break;
     }
@@ -612,6 +645,12 @@ int usbint_handler_cmd(void) {
             server_info.offset |= cmd_buffer[258]; server_info.offset <<= 8;
             server_info.offset |= cmd_buffer[259]; server_info.offset <<= 0;
         }
+        break;
+    }
+    case USBINT_SERVER_OPCODE_CDC2P: {
+        /* Protocol upgrade: finish the legacy USBA response, then switch the
+           CDC data endpoint into USB2P framed byte-stream mode. */
+        CDC2P_EnableAfterLegacyResponse();
         break;
     }
     default: // unrecognized

@@ -483,6 +483,32 @@ uint32_t USB_ReadEP (uint32_t EPNum, uint8_t *pData) {
  *    Return Value:    Number of bytes written
  */
 
+/*
+ *  Report whether the IN endpoint can accept another packet right now.
+ *    Parameters:      EPNum: Endpoint Number (with 0x80 IN bit)
+ *    Return Value:    1 if a write buffer is free, 0 if both are occupied
+ *
+ *  Uses the SELECT_ENDPOINT status byte's bit 0 (EP_SEL_F) — the SIE's own
+ *  "this endpoint's write buffer is full" flag, which is clear while at least
+ *  one of the two physical buffers is free.  This is the exact idiom the stock
+ *  driver uses (Endpoint_IsINReady), and it is the authority a writer must
+ *  consult before CMD_VALID_BUF — a software outstanding-count drifts when the
+ *  LPC coalesces two buffer-drains into a single EP interrupt.
+ *
+ *  SELECT_ENDPOINT is two-phase: the command (CMD_SEL_EP, terminates on CCEMTY)
+ *  then the status read (DAT_SEL_EP, terminates on CDFULL).  Passing the command
+ *  code to the data-read path waits on a CDFULL that never arrives and hangs the
+ *  SIE, so both phases are issued as the stock driver does.
+ */
+uint32_t USB_TxBufAvail (uint32_t EPNum) {
+  uint32_t st;
+
+  WrCmd(CMD_SEL_EP(EPAdr(EPNum)));
+  st = RdCmdDat(DAT_SEL_EP(EPAdr(EPNum)));
+
+  return (st & EP_SEL_F) ? 0u : 1u;
+}
+
 uint32_t USB_WriteEP (uint32_t EPNum, uint8_t *pData, uint32_t cnt) {
   uint32_t n;
 

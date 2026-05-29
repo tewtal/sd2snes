@@ -32,7 +32,7 @@ void ymodem_rxfile(FIL* fil) {
   UINT written;
   FRESULT res = FR_OK;
   uint16_t crc = 0, crc_sender;
-  uint32_t filesize, remaining = 0;
+  uint32_t filesize = 0, remaining = 0;  /* init: silences GCC 12 -Wmaybe-uninitialized (only read when have_filesize) */
   int have_filesize = 0, first_block = 1;
   uart_flush();
 restart:
